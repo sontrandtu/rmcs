@@ -15,11 +15,18 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
+// RPi 4 v4l2h264enc is currently broken on the bcm2835_codec driver shipped with
+// this Pi OS / kernel: even a trivial videotestsrc -> v4l2h264enc pipeline errors
+// with "Failed to process frame" on the first buffer. Skipping detection until
+// a kernel/firmware update fixes it. Flip this to true to re-enable.
+const enableRPiV4L2Encoder = false
+
 // Global cache for encoder detection to avoid slow gst-inspect calls
 var (
-	encoderDetectionDone   bool
-	hasNVIDIAEncoder       bool
-	encoderDetectionMutex  sync.Mutex
+	encoderDetectionDone  bool
+	hasNVIDIAEncoder      bool
+	hasRPiV4L2Encoder     bool
+	encoderDetectionMutex sync.Mutex
 )
 
 type ROSSubscriber struct {
@@ -81,14 +88,18 @@ func NewROSSubscriber(track *webrtc.TrackLocalStaticSample, cameraIndex int, ros
 	topicName := getTopicName(cameraIndex)
 
 	return &ROSSubscriber{
-		track:               track,
-		trackID:             trackID,
-		topicName:           topicName,
-		rosMasterURI:        rosMasterURI,
-		stopChan:            make(chan bool),
-		fps:                 fps,
-		sampleDurationUs:    1000000 / uint64(fps),
-		minFrameInterval:    time.Duration(1000000/uint64(fps)) * time.Microsecond, // 33.33ms at 30fps
+		track:            track,
+		trackID:          trackID,
+		topicName:        topicName,
+		rosMasterURI:     rosMasterURI,
+		stopChan:         make(chan bool),
+		fps:              fps,
+		sampleDurationUs: 1000000 / uint64(fps),
+		// Half the perfect-period gives jitter slack: at 30fps target, allow up to
+		// 60fps input through. Real ROS @30fps with timing jitter passes cleanly.
+		// If rosbag overruns (e.g. --rate 3.0 -> ~90fps), x264's stdin pipe blocks
+		// naturally and absorbs the overflow.
+		minFrameInterval: time.Duration(1000000/uint64(fps)/2) * time.Microsecond, // ~16.67ms at 30fps
 		// Don't initialize dimensions - detect from first frame
 		width:                0,
 		height:               0,
@@ -250,34 +261,42 @@ func (r *ROSSubscriber) initGStreamer() error {
 		r.width, r.height, r.fps, r.fps,
 	)
 
-	// Check if NVIDIA encoder is available (cached to avoid slow gst-inspect)
+	// Check available hardware encoders (cached, gst-inspect is slow)
+	// Preference: NVIDIA (Jetson) > V4L2 (Raspberry Pi 4) > x264 (CPU)
 	var pipeline string
 	encoderDetectionMutex.Lock()
 	if !encoderDetectionDone {
 		log.Printf("First-time encoder detection (this may take a few seconds)...")
-		checkCmd := exec.Command("gst-inspect-1.0", "nvv4l2h264enc")
-		hasNVIDIAEncoder = (checkCmd.Run() == nil)
+		hasNVIDIAEncoder = exec.Command("gst-inspect-1.0", "nvv4l2h264enc").Run() == nil
+		if !hasNVIDIAEncoder && enableRPiV4L2Encoder {
+			hasRPiV4L2Encoder = exec.Command("gst-inspect-1.0", "v4l2h264enc").Run() == nil
+		}
 		encoderDetectionDone = true
-		if hasNVIDIAEncoder {
-			log.Printf("NVIDIA hardware encoder detected (will be used for all streams)")
-		} else {
-			log.Printf("NVIDIA encoder not available, using x264 software encoder (will be used for all streams)")
+		switch {
+		case hasNVIDIAEncoder:
+			log.Printf("NVIDIA nvv4l2h264enc hardware encoder detected (will be used for all streams)")
+		case hasRPiV4L2Encoder:
+			log.Printf("RPi v4l2h264enc hardware encoder detected (will be used for all streams)")
+		default:
+			log.Printf("No hardware encoder available, falling back to x264enc software (will be used for all streams)")
 		}
 	}
 	useNVIDIA := hasNVIDIAEncoder
+	useRPi := hasRPiV4L2Encoder
 	encoderDetectionMutex.Unlock()
 
-	if useNVIDIA {
-		// NVIDIA encoder available - use it
+	switch {
+	case useNVIDIA:
 		log.Printf("Using NVIDIA nvv4l2h264enc hardware encoder")
 		pipeline = nvidiaPipeline
 		r.cmd = exec.Command("/bin/sh", "-c", nvidiaPipeline)
-	} else {
-		// NVIDIA encoder not available - fall back to software encoder
-		log.Printf("NVIDIA encoder not available (running on Mac/x86?), falling back to x264enc software encoder")
 
-		// x264enc requires even dimensions - pad if necessary
-		// Round width and height to next even number
+	case useRPi:
+		// Raspberry Pi 4 hardware encoder (VideoCore VI via V4L2).
+		// h264_profile=1 = Constrained Baseline, matches SDP profile-level-id=42001f.
+		// h264_i_frame_period = keyframes per N frames.
+		// video_bitrate matches the NVIDIA pipeline (1.5 Mbps).
+		// Hardware encoder needs even dimensions; pad if necessary.
 		evenWidth := r.width
 		if evenWidth%2 != 0 {
 			evenWidth++
@@ -286,15 +305,53 @@ func (r *ROSSubscriber) initGStreamer() error {
 		if evenHeight%2 != 0 {
 			evenHeight++
 		}
+		log.Printf("Padding dimensions from %dx%d to %dx%d for v4l2h264enc", r.width, r.height, evenWidth, evenHeight)
 
+		// Minimal pipeline. Don't force NV12 input -- some RPi firmwares reject it
+		// at preroll. Don't pass extra-controls -- driver-specific control IDs cause
+		// "Failed to process frame" on the first buffer. Let videoconvert and the
+		// encoder negotiate the format; assert baseline profile downstream.
+		rpiPipeline := fmt.Sprintf(
+			"gst-launch-1.0 -q fdsrc ! rawvideoparse width=%d height=%d format=bgr framerate=%d/1 ! "+
+				"videoconvert ! videoscale ! video/x-raw,width=%d,height=%d ! "+
+				"v4l2h264enc ! "+
+				"h264parse config-interval=-1 ! "+
+				"video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au ! "+
+				"fdsink",
+			r.width, r.height, r.fps, evenWidth, evenHeight,
+		)
+		log.Printf("Using RPi v4l2h264enc hardware encoder")
+		pipeline = rpiPipeline
+		r.cmd = exec.Command("/bin/sh", "-c", rpiPipeline)
+
+	default:
+		// CPU fallback. profile=constrained-baseline matches SDP profile-level-id=42001f.
+		// rc-lookahead=0 + sync-lookahead=0 kill x264's ~1.3s rate-control buffering.
+		// bframes=0 required: WebRTC H.264 cannot carry B-frames.
+		log.Printf("No hardware encoder, falling back to x264enc software encoder")
+		evenWidth := r.width
+		if evenWidth%2 != 0 {
+			evenWidth++
+		}
+		evenHeight := r.height
+		if evenHeight%2 != 0 {
+			evenHeight++
+		}
 		log.Printf("Padding dimensions from %dx%d to %dx%d for x264enc", r.width, r.height, evenWidth, evenHeight)
 
-		// Use videoscale to pad to even dimensions, then encode with x264
+		// Match the original working pipeline (which streamed cleanly but with lag).
+		// The lag came from x264's default rc-lookahead=40 frames (~1.3s buffering).
+		// Setting rc-lookahead=0 + sync-lookahead=0 removes that.
+		// Do NOT add sliced-threads=true: it produces multi-slice frames whose RTP
+		// packets corrupt visibly (purple/magenta blocks) on any packet reorder/loss.
+		// Default frame-parallel threading produces single-slice output that decodes cleanly.
 		softwarePipeline := fmt.Sprintf(
 			"gst-launch-1.0 -q fdsrc ! rawvideoparse width=%d height=%d format=bgr framerate=%d/1 ! "+
 				"videoconvert ! videoscale ! video/x-raw,width=%d,height=%d,format=I420 ! "+
-				"x264enc bitrate=2000 speed-preset=ultrafast tune=zerolatency key-int-max=%d ! "+
-				"h264parse config-interval=-1 ! fdsink",
+				"x264enc bitrate=3000 speed-preset=ultrafast key-int-max=%d "+
+				"bframes=0 rc-lookahead=0 sync-lookahead=0 threads=2 ! "+
+				"video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au ! "+
+				"h264parse config-interval=-1 ! fdsink sync=false",
 			r.width, r.height, r.fps, evenWidth, evenHeight, r.fps,
 		)
 		pipeline = softwarePipeline
@@ -347,8 +404,8 @@ func (r *ROSSubscriber) initGStreamer() error {
 			// Check if this was an intentional kill (e.g., during camera switch)
 			exitErr, isExitError := err.(*exec.ExitError)
 			if isExitError && (exitErr.String() == "signal: killed" ||
-			                    exitErr.String() == "waitid: no child processes" ||
-			                    exitErr.String() == "wait: no child processes") {
+				exitErr.String() == "waitid: no child processes" ||
+				exitErr.String() == "wait: no child processes") {
 				log.Printf("GStreamer stopped for track %s (camera switch or cleanup)", r.trackID)
 			} else {
 				log.Printf("GStreamer process CRASHED for track %s: %v", r.trackID, err)

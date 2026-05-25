@@ -10,7 +10,7 @@ if [ "$#" -lt 8 ]; then
     echo "Usage: $0 <ros-master-ip> <topic1> <topic2> <topic3> <topic4> <topic5> <topic6> <topic7>"
     echo ""
     echo "Examples:"
-    echo "  $0 192.168.1.100 /leopard/id1/image_raw /leopard/id2/image_raw /leopard/id3/image_raw /leopard/id4/image_raw /leopard/id5/image_raw /leopard/id6/image_raw /leopard/id7/image_raw"
+    echo "  $0 192.168.1.100 /leopard/id1/image_resized /leopard/id3/image_resized /leopard/id4/image_resized /leopard/id5/image_resized /leopard/id6/image_resized /leopard/id7/image_resized /flir/id8/image_resized"
     echo ""
     echo "All 7 topics must be provided. Client can switch between them using camera buttons 1-7."
     exit 1

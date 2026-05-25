@@ -244,15 +244,10 @@ func (a *AudioPlayback) DecodeLoop(track *webrtc.TrackRemote) {
 
 		packetCount++
 		
-		// Check payload size
+		// Empty RTP payloads are normal: browsers send them during DTX
+		// (silence) or as keepalive. Skip silently.
 		if len(rtp.Payload) == 0 {
 			emptyPayloadCount++
-			if emptyPayloadCount <= 5 {
-				log.Printf("WARNING: Empty RTP payload (packet %d, timestamp: %d) - skipping", packetCount, rtp.Timestamp)
-			}
-			if emptyPayloadCount == 5 {
-				log.Printf("WARNING: Suppressing further empty payload warnings")
-			}
 			continue
 		}
 		
@@ -333,11 +328,17 @@ func (a *AudioPlayback) TimedPlaybackLoop() {
 			if _, err := a.stdin.Write(pcmBytes); err != nil {
 				if a.running {
 					log.Printf("Audio playback write error: %v", err)
-					// If first write fails (device not available), switch to dummy mode
 					if firstWrite {
 						log.Println("Audio playback device not available, discarding audio for testing")
 						useDummyPlayback = true
 					} else {
+						log.Println("Audio playback failed (FFmpeg/ALSA died) - disabling audio, video continues")
+						a.mu.Lock()
+						a.running = false
+						a.mu.Unlock()
+						if a.jitterBuffer != nil {
+							a.jitterBuffer.cond.Broadcast()
+						}
 						break
 					}
 				}
