@@ -1,6 +1,9 @@
 # Setup the environment on Raspberry Pi 4
 
 ## Overview
+
+⚠️ **Important:** The installation procedures are identical to those for the Jetson platform. However, the following additional configuration is required:
+
 - Install GStreamer package
 
 ⚠️ **Important:** On Jetson, GStreamer is pre-installed in the system core by default by the vendor (NVIDIA). However, on Raspberry Pi 4, GStreamer is not available out of the box. Therefore, installing GStreamer is mandatory on Raspberry Pi 4 for RMCS to function properly.
